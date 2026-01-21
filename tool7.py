@@ -555,7 +555,7 @@ class MainWindow(QWidget):
         self.scope_table = QTableWidget()
         self.scope_table.setColumnCount(6)
         self.scope_table.setHorizontalHeaderLabels(
-            ["Use", "Function", "Automation phase", "Time/op [min]", "Cost [k€]", "Crew per shift (manual)"]
+            ["Use", "Function", "Automation phase", "Time/op [min]", "Cost [k€]", "crew per shift w robot"]
         )
         self.scope_table.setAlternatingRowColors(True)
         self.scope_table.verticalHeader().setVisible(False)
@@ -837,7 +837,7 @@ class MainWindow(QWidget):
 
             for k, v in crew_manual.items():
                 if enabled.get(k, True) and v < 0:
-                    raise ValueError(f"Crew per shift (manual) must be >= 0 (check '{k}').")
+                    raise ValueError(f"crew per shift w robot must be >= 0 (check '{k}').")
 
             for life_name, life_val in [
                 ("Plate life", inputs.plate_life),
@@ -977,7 +977,7 @@ class MainWindow(QWidget):
                 headers = ["Use", "Function", "Phase", "Time/op [min]"]
                 if show_costs:
                     headers.append("Cost [k€]")
-                headers.append("Crew per shift (manual)")
+                headers.append("crew per shift w robot")
                 w.writerow(headers)
 
                 for d in ops_definitions():
