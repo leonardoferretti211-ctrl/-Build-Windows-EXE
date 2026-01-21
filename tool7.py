@@ -40,13 +40,14 @@ from PyQt6.QtWidgets import (
 # ============================================================
 
 APP_NAME = "Automation Roadmap Tool"
-APP_VERSION = "v1.2.1"
+APP_VERSION = "v1.2.2"
 RELEASE_DATE = "2026-01-17"  # YYYY-MM-DD
 
 LOGO_PATH = "vesuvius_logo.png"
 
 
 def resource_path(relative_path: str) -> str:
+    """Works in dev (python) and in PyInstaller onefile/onedir."""
     base = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
     return os.path.join(base, relative_path)
 
@@ -70,14 +71,14 @@ class Inputs:
     working_days_year: float
     working_days_month: float
 
-    # FTE / payroll model (customer-driven)
-    crew_per_shift_today: float          # people/shift in area today
-    shifts_per_day: float               # e.g. 3 to cover 24h
-    hse_min_crew_per_shift: float       # floor per shift
-    avg_operator_cost_year: float       # €/year per headcount
+    # Crew / shift / labor cost model
+    crew_per_shift_baseline: float           # baseline crew per shift in the area
+    shifts_per_day: float                    # number of shifts per day
+    min_crew_per_shift_hse: float            # HSE floor (per shift)
+    avg_operator_cost_year: float            # €/year per paid headcount
 
-    # When automated, how many people are still needed per shift (default 1, optional 0)
-    automated_people_required: float
+    # When a function is automated: crew per shift required for that function (default 1, optional 0)
+    automated_crew_per_shift: float
 
 
 @dataclass
@@ -87,7 +88,7 @@ class OperationDef:
     default_time_min: float
     default_phase: str
     default_cost_k_eur: float
-    default_people_today: float
+    default_crew_per_shift_manual: float
 
 
 @dataclass
@@ -102,15 +103,16 @@ class PhaseResults:
     investment_k_eur_total: float
     investment_k_eur_incremental: float
 
-    # Payroll model outputs
-    crew_required_per_shift: float
-    payroll_today: float
-    payroll_required: float
-    headcount_saved: float
-    cost_saved_year: float
+    # Crew model outputs
+    crew_per_shift_required: float
+    paid_headcount_baseline: float
+    paid_headcount_required: float
+    paid_headcount_saved: float
+    annual_labor_cost_reduction: float
 
 
 def ops_definitions() -> List[OperationDef]:
+    # Baseline ops/day formulas
     def cylinder(inputs: Inputs) -> float:
         return inputs.heat_per_day * 2
 
@@ -141,6 +143,7 @@ def ops_definitions() -> List[OperationDef]:
     def pp_exchange(inputs: Inputs) -> float:
         return inputs.heat_per_day / inputs.pp_life
 
+    # default_crew_per_shift_manual are placeholders; user can tune per plant/customer
     return [
         OperationDef("Cylinder manipulation", cylinder, 1, "Phase 1", 100, 2),
         OperationDef("CNT tip cleaning", tip_clean, 3, "Phase 2", 100, 2),
@@ -169,47 +172,51 @@ def workload_h_per_day(ops_per_day: float, time_min: float) -> float:
     return ops_per_day * time_min / 60.0
 
 
-def remaining_ops_for_phase(
-    op_name: str,
-    baseline_ops: float,
-    selected_phase: str,
-    phase_n: int,
-    inputs: Inputs
-) -> float:
+def remaining_ops_for_phase(op_name: str, baseline_ops: float, selected_phase: str, phase_n: int, inputs: Inputs) -> float:
     auto_at = phase_index(selected_phase)
     if phase_n < auto_at:
         return baseline_ops
-
+    # automated
     if op_name == "O₂ lancing":
         return (1.0 - inputs.o2_success) * baseline_ops
     return 0.0
 
 
-def crew_required_per_shift_for_phase(
+def crew_per_shift_required_for_phase(
     defs: List[OperationDef],
     enabled: Dict[str, bool],
     phases: Dict[str, str],
-    people_today: Dict[str, float],
+    crew_manual_per_shift: Dict[str, float],
     phase_n: int,
-    hse_min_crew_per_shift: float,
-    automated_people_required: float,
+    min_crew_per_shift_hse: float,
+    automated_crew_per_shift: float,
 ) -> float:
+    """
+    Customer-driven crew sizing:
+    - if a function is automated by this phase -> crew required becomes automated_crew_per_shift (default 1, optional 0)
+    - else -> crew_manual_per_shift(function)
+    - crew required in the area = max(of active functions) and at least min_crew_per_shift_hse
+    """
     reqs: List[float] = []
+
     for d in defs:
         if not enabled.get(d.name, True):
             continue
+
         sel_phase = phases.get(d.name, d.default_phase)
         automated = phase_n >= phase_index(sel_phase)
+
         if automated:
-            req = float(automated_people_required)
+            req = float(automated_crew_per_shift)
         else:
-            req = float(people_today.get(d.name, d.default_people_today))
+            req = float(crew_manual_per_shift.get(d.name, d.default_crew_per_shift_manual))
+
         reqs.append(req)
 
     if not reqs:
-        return max(0.0, float(hse_min_crew_per_shift))
+        return max(0.0, float(min_crew_per_shift_hse))
 
-    return max(float(hse_min_crew_per_shift), max(reqs))
+    return max(float(min_crew_per_shift_hse), max(reqs))
 
 
 def compute_results(
@@ -218,13 +225,14 @@ def compute_results(
     phases: Dict[str, str],
     costs_k_eur: Dict[str, float],
     enabled: Dict[str, bool],
-    people_today: Dict[str, float],
+    crew_manual_per_shift: Dict[str, float],
 ) -> Tuple[float, Dict[int, PhaseResults]]:
     defs = ops_definitions()
 
     baseline_h = 0.0
     remaining_h = {1: 0.0, 2: 0.0, 3: 0.0}
 
+    # Solutions used up to each phase (cumulative)
     solutions_up_to: Dict[int, List[str]] = {1: [], 2: [], 3: []}
     for phase_n in (1, 2, 3):
         used = []
@@ -236,6 +244,7 @@ def compute_results(
                 used.append(d.name)
         solutions_up_to[phase_n] = used
 
+    # Investment cumulative per phase (only enabled)
     invest_total = {1: 0.0, 2: 0.0, 3: 0.0}
     for phase_n in (1, 2, 3):
         s = 0.0
@@ -248,9 +257,11 @@ def compute_results(
                 s += c
         invest_total[phase_n] = s
 
+    # Baseline + remaining workload
     for d in defs:
         if not enabled.get(d.name, True):
             continue
+
         ops = float(d.ops_per_day_fn(inputs))
         tmin = float(times_min.get(d.name, d.default_time_min))
         baseline_h += workload_h_per_day(ops, tmin)
@@ -259,6 +270,10 @@ def compute_results(
         for phase_n in (1, 2, 3):
             rem_ops = remaining_ops_for_phase(d.name, ops, sel_phase, phase_n, inputs)
             remaining_h[phase_n] += workload_h_per_day(rem_ops, tmin)
+
+    # Paid headcount baseline (crew per shift * shifts/day)
+    shifts_per_day = float(inputs.shifts_per_day)
+    paid_headcount_baseline = float(inputs.crew_per_shift_baseline) * shifts_per_day
 
     phase_results: Dict[int, PhaseResults] = {}
     for phase_n in (1, 2, 3):
@@ -272,16 +287,19 @@ def compute_results(
         inv_total_k = invest_total[phase_n]
         inv_incr_k = inv_total_k - (invest_total[phase_n - 1] if phase_n > 1 else 0.0)
 
-        # Payroll logic (your example)
-        crew_req_shift = crew_required_per_shift_for_phase(
-            defs, enabled, phases, people_today, phase_n,
-            inputs.hse_min_crew_per_shift, inputs.automated_people_required
+        crew_req_per_shift = crew_per_shift_required_for_phase(
+            defs=defs,
+            enabled=enabled,
+            phases=phases,
+            crew_manual_per_shift=crew_manual_per_shift,
+            phase_n=phase_n,
+            min_crew_per_shift_hse=inputs.min_crew_per_shift_hse,
+            automated_crew_per_shift=inputs.automated_crew_per_shift,
         )
 
-        payroll_today = float(inputs.crew_per_shift_today) * float(inputs.shifts_per_day)
-        payroll_required = float(crew_req_shift) * float(inputs.shifts_per_day)
-        headcount_saved = max(0.0, payroll_today - payroll_required)
-        cost_saved = headcount_saved * float(inputs.avg_operator_cost_year)
+        paid_headcount_required = crew_req_per_shift * shifts_per_day
+        paid_headcount_saved = max(0.0, paid_headcount_baseline - paid_headcount_required)
+        annual_labor_cost_reduction = paid_headcount_saved * float(inputs.avg_operator_cost_year)
 
         phase_results[phase_n] = PhaseResults(
             remaining_h_per_day=rem,
@@ -292,11 +310,11 @@ def compute_results(
             solutions_used=solutions_up_to[phase_n],
             investment_k_eur_total=inv_total_k,
             investment_k_eur_incremental=inv_incr_k,
-            crew_required_per_shift=crew_req_shift,
-            payroll_today=payroll_today,
-            payroll_required=payroll_required,
-            headcount_saved=headcount_saved,
-            cost_saved_year=cost_saved,
+            crew_per_shift_required=crew_req_per_shift,
+            paid_headcount_baseline=paid_headcount_baseline,
+            paid_headcount_required=paid_headcount_required,
+            paid_headcount_saved=paid_headcount_saved,
+            annual_labor_cost_reduction=annual_labor_cost_reduction,
         )
 
     return baseline_h, phase_results
@@ -328,12 +346,12 @@ def make_card(title: str) -> Tuple[QGroupBox, QLabel, QLabel, QLabel, QLabel, QL
     solutions = QLabel("Solutions used: -")
     solutions.setWordWrap(True)
 
-    crew = QLabel("Crew required: -")
-    fte = QLabel("Headcount / cost: -")
+    crew = QLabel("Crew model: -")
+    labor = QLabel("Labor saving: -")
     crew.setWordWrap(True)
-    fte.setWordWrap(True)
+    labor.setWordWrap(True)
 
-    for w in (remaining, saving, extrap, invest, solutions, crew, fte):
+    for w in (remaining, saving, extrap, invest, solutions, crew, labor):
         w.setFont(big_font(11, False))
 
     layout.addWidget(main)
@@ -349,9 +367,9 @@ def make_card(title: str) -> Tuple[QGroupBox, QLabel, QLabel, QLabel, QLabel, QL
     layout.addWidget(invest)
     layout.addWidget(solutions)
     layout.addWidget(crew)
-    layout.addWidget(fte)
+    layout.addWidget(labor)
 
-    return box, main, remaining, saving, extrap, invest, solutions, crew, fte
+    return box, main, remaining, saving, extrap, invest, solutions, crew, labor
 
 
 def fmt_h_day(x: float) -> str:
@@ -383,14 +401,14 @@ class MainWindow(QWidget):
         super().__init__()
 
         self.setWindowTitle(f"{APP_NAME} — {APP_VERSION} ({RELEASE_DATE})")
-        self.setMinimumSize(1260, 780)
+        self.setMinimumSize(1300, 820)
 
         self._last_inputs: Inputs | None = None
         self._last_times: Dict[str, float] | None = None
         self._last_phases: Dict[str, str] | None = None
         self._last_costs: Dict[str, float] | None = None
         self._last_enabled: Dict[str, bool] | None = None
-        self._last_people_today: Dict[str, float] | None = None
+        self._last_crew_manual: Dict[str, float] | None = None
         self._last_baseline_h: float | None = None
         self._last_phase_res: Dict[int, PhaseResults] | None = None
 
@@ -398,6 +416,7 @@ class MainWindow(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
+        # Header with logo + title + version
         header = QHBoxLayout()
         header.setSpacing(10)
 
@@ -429,11 +448,14 @@ class MainWindow(QWidget):
         splitter.setChildrenCollapsible(False)
         root.addWidget(splitter, 1)
 
-        # LEFT
+        # ====================================================
+        # LEFT (Scenario)
+        # ====================================================
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setSpacing(12)
 
+        # Process assumptions
         proc_box = QGroupBox("Scenario builder – Process assumptions")
         proc_layout = QGridLayout(proc_box)
         proc_layout.setHorizontalSpacing(10)
@@ -449,6 +471,7 @@ class MainWindow(QWidget):
         self.pplife = QLineEdit("20")
         self.o2 = QLineEdit("0.95")
 
+        # Show/hide costs toggle
         self.chk_show_costs = QCheckBox("Show cost & investment")
         self.chk_show_costs.setChecked(True)
         self.chk_show_costs.stateChanged.connect(self.on_toggle_costs)
@@ -472,7 +495,7 @@ class MainWindow(QWidget):
         proc_layout.addWidget(self.chk_show_costs, len(rows), 0, 1, 3)
         left_layout.addWidget(proc_box)
 
-        # Extrapolation + payroll model
+        # Extrapolation assumptions (+ crew model)
         extra_box = QGroupBox("Scenario builder – Extrapolation")
         extra_layout = QGridLayout(extra_box)
         extra_layout.setHorizontalSpacing(10)
@@ -481,44 +504,44 @@ class MainWindow(QWidget):
         self.days_month = QLineEdit("22")
         self.days_year = QLineEdit("250")
 
-        extra_layout.addWidget(QLabel("Working days / month"), 0, 0)
+        extra_layout.addWidget(QLabel("Working days per month"), 0, 0)
         extra_layout.addWidget(self.days_month, 0, 1)
         extra_layout.addWidget(QLabel("Default: 22"), 0, 2)
 
-        extra_layout.addWidget(QLabel("Working days / year"), 1, 0)
+        extra_layout.addWidget(QLabel("Working days per year"), 1, 0)
         extra_layout.addWidget(self.days_year, 1, 1)
         extra_layout.addWidget(QLabel("Default: 250"), 1, 2)
 
-        self.chk_fte = QCheckBox("Enable payroll model (crew + shifts + cost)")
-        self.chk_fte.setChecked(False)
-        self.chk_fte.stateChanged.connect(self.on_toggle_fte)
+        self.chk_crew_model = QCheckBox("Enable crew & labor cost model")
+        self.chk_crew_model.setChecked(False)
+        self.chk_crew_model.stateChanged.connect(self.on_toggle_crew_model)
 
-        self.crew_shift_today = QLineEdit("3")   # people per shift today
-        self.shifts_day = QLineEdit("3")         # shifts per day (24h coverage)
-        self.hse_min_shift = QLineEdit("1")      # floor per shift
-        self.op_cost_year = QLineEdit("70000")   # €/year per headcount
+        self.crew_baseline = QLineEdit("3")
+        self.shifts_day = QLineEdit("3")
+        self.hse_floor = QLineEdit("1")
+        self.op_cost_year = QLineEdit("70000")
 
-        self.chk_auto_to_zero = QCheckBox("When automated: allow 0 people/shift (otherwise 1)")
+        self.chk_auto_to_zero = QCheckBox("When automated: crew per shift can be 0 (otherwise 1)")
         self.chk_auto_to_zero.setChecked(False)
         self.chk_auto_to_zero.stateChanged.connect(lambda _=None: self.on_calculate())
 
-        extra_layout.addWidget(self.chk_fte, 2, 0, 1, 3)
+        extra_layout.addWidget(self.chk_crew_model, 2, 0, 1, 3)
 
-        extra_layout.addWidget(QLabel("Crew in area today [people/shift]"), 3, 0)
-        extra_layout.addWidget(self.crew_shift_today, 3, 1)
-        extra_layout.addWidget(QLabel("Client / plant dependent"), 3, 2)
+        extra_layout.addWidget(QLabel("Crew per shift (baseline)"), 3, 0)
+        extra_layout.addWidget(self.crew_baseline, 3, 1)
+        extra_layout.addWidget(QLabel("Plant / customer dependent"), 3, 2)
 
-        extra_layout.addWidget(QLabel("Shifts per day"), 4, 0)
+        extra_layout.addWidget(QLabel("Number of shifts per day"), 4, 0)
         extra_layout.addWidget(self.shifts_day, 4, 1)
-        extra_layout.addWidget(QLabel("e.g. 3 shifts for 24h"), 4, 2)
+        extra_layout.addWidget(QLabel("e.g. 3 for 24/7"), 4, 2)
 
-        extra_layout.addWidget(QLabel("Minimum crew floor (HSE) [people/shift]"), 5, 0)
-        extra_layout.addWidget(self.hse_min_shift, 5, 1)
-        extra_layout.addWidget(QLabel("Min crew always present"), 5, 2)
+        extra_layout.addWidget(QLabel("Minimum crew per shift (HSE floor)"), 5, 0)
+        extra_layout.addWidget(self.hse_floor, 5, 1)
+        extra_layout.addWidget(QLabel("Minimum staffing constraint"), 5, 2)
 
-        extra_layout.addWidget(QLabel("Avg operator cost / year [€ per headcount]"), 6, 0)
+        extra_layout.addWidget(QLabel("Average operator cost per year [€]"), 6, 0)
         extra_layout.addWidget(self.op_cost_year, 6, 1)
-        extra_layout.addWidget(QLabel("Annual cost reduction uses payroll headcount"), 6, 2)
+        extra_layout.addWidget(QLabel("Used for annual labor savings"), 6, 2)
 
         extra_layout.addWidget(self.chk_auto_to_zero, 7, 0, 1, 3)
 
@@ -532,7 +555,7 @@ class MainWindow(QWidget):
         self.scope_table = QTableWidget()
         self.scope_table.setColumnCount(6)
         self.scope_table.setHorizontalHeaderLabels(
-            ["Use", "Function", "Automation phase", "Time/op [min]", "Cost [k€]", "People today [per shift]"]
+            ["Use", "Function", "Automation phase", "Time/op [min]", "Cost [k€]", "Crew per shift (manual)"]
         )
         self.scope_table.setAlternatingRowColors(True)
         self.scope_table.verticalHeader().setVisible(False)
@@ -549,8 +572,10 @@ class MainWindow(QWidget):
         btn_row = QHBoxLayout()
         self.btn_calc = QPushButton("Recalculate")
         self.btn_calc.clicked.connect(self.on_calculate)
+
         self.btn_reset = QPushButton("Reset defaults")
         self.btn_reset.clicked.connect(self.reset_defaults)
+
         btn_row.addWidget(self.btn_calc)
         btn_row.addWidget(self.btn_reset)
         btn_row.addStretch(1)
@@ -564,12 +589,14 @@ class MainWindow(QWidget):
         left_scroll.setWidget(left_container)
         splitter.addWidget(left_scroll)
 
-        # RIGHT
+        # ====================================================
+        # RIGHT (Results)
+        # ====================================================
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setSpacing(12)
 
-        title = QLabel("Executive results – Workload, investment & payroll by phase")
+        title = QLabel("Executive results – Workload, investment & labor impact by phase")
         title.setFont(big_font(14, True))
         right_layout.addWidget(title)
 
@@ -578,7 +605,7 @@ class MainWindow(QWidget):
         base_layout.setSpacing(8)
         self.lbl_baseline_main = QLabel("-")
         self.lbl_baseline_main.setFont(big_font(26, True))
-        self.lbl_baseline_sub = QLabel("Manual workload today (based on enabled functions)")
+        self.lbl_baseline_sub = QLabel("Manual workload baseline (based on enabled functions)")
         self.lbl_baseline_sub.setStyleSheet("color: #666;")
         base_layout.addWidget(self.lbl_baseline_main)
         base_layout.addWidget(self.lbl_baseline_sub)
@@ -604,18 +631,23 @@ class MainWindow(QWidget):
 
         splitter.setSizes([640, 640])
 
-        # maps
+        # table maps
         self._use_widgets: Dict[str, QCheckBox] = {}
         self._phase_widgets: Dict[str, QComboBox] = {}
         self._time_items: Dict[str, QTableWidgetItem] = {}
         self._cost_items: Dict[str, QTableWidgetItem] = {}
-        self._people_items: Dict[str, QTableWidgetItem] = {}
+        self._crew_items: Dict[str, QTableWidgetItem] = {}
 
         self.populate_scope_table()
         self._resize_scope_table_to_content()
+
         self.on_toggle_costs()
-        self.on_toggle_fte()
+        self.on_toggle_crew_model()
         self.on_calculate()
+
+    # ----------------------------
+    # Branding
+    # ----------------------------
 
     def _load_logo(self) -> None:
         p = resource_path(LOGO_PATH)
@@ -627,6 +659,10 @@ class MainWindow(QWidget):
                 self.logo.setToolTip("Vesuvius")
                 return
         self.logo.setText("")
+
+    # ----------------------------
+    # UI setup
+    # ----------------------------
 
     def populate_scope_table(self) -> None:
         defs = ops_definitions()
@@ -660,10 +696,10 @@ class MainWindow(QWidget):
             self.scope_table.setItem(r, 4, cost_item)
             self._cost_items[d.name] = cost_item
 
-            ppl_item = QTableWidgetItem(f"{d.default_people_today:g}")
-            ppl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
-            self.scope_table.setItem(r, 5, ppl_item)
-            self._people_items[d.name] = ppl_item
+            crew_item = QTableWidgetItem(f"{d.default_crew_per_shift_manual:g}")
+            crew_item.setTextAlignment(int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+            self.scope_table.setItem(r, 5, crew_item)
+            self._crew_items[d.name] = crew_item
 
         self.scope_table.resizeRowsToContents()
 
@@ -681,21 +717,26 @@ class MainWindow(QWidget):
             self._phase_widgets[d.name].setCurrentText(d.default_phase)
             self._time_items[d.name].setText(f"{d.default_time_min:g}")
             self._cost_items[d.name].setText(f"{d.default_cost_k_eur:g}")
-            self._people_items[d.name].setText(f"{d.default_people_today:g}")
+            self._crew_items[d.name].setText(f"{d.default_crew_per_shift_manual:g}")
 
         self.days_month.setText("22")
         self.days_year.setText("250")
+
         self.chk_show_costs.setChecked(True)
 
-        self.chk_fte.setChecked(False)
-        self.crew_shift_today.setText("3")
+        self.chk_crew_model.setChecked(False)
+        self.crew_baseline.setText("3")
         self.shifts_day.setText("3")
-        self.hse_min_shift.setText("1")
+        self.hse_floor.setText("1")
         self.op_cost_year.setText("70000")
         self.chk_auto_to_zero.setChecked(False)
 
         self._resize_scope_table_to_content()
         self.on_calculate()
+
+    # ----------------------------
+    # Toggles
+    # ----------------------------
 
     def on_toggle_costs(self) -> None:
         show = self.chk_show_costs.isChecked()
@@ -705,23 +746,28 @@ class MainWindow(QWidget):
         self.lbl_note.setVisible(show)
         self.on_calculate()
 
-    def on_toggle_fte(self) -> None:
-        show = self.chk_fte.isChecked()
+    def on_toggle_crew_model(self) -> None:
+        show = self.chk_crew_model.isChecked()
 
-        for w in (self.crew_shift_today, self.shifts_day, self.hse_min_shift, self.op_cost_year, self.chk_auto_to_zero):
+        for w in (self.crew_baseline, self.shifts_day, self.hse_floor, self.op_cost_year, self.chk_auto_to_zero):
             w.setEnabled(show)
 
         for card in (self.card_p1, self.card_p2, self.card_p3):
             card[7].setVisible(show)  # crew label
-            card[8].setVisible(show)  # payroll label
+            card[8].setVisible(show)  # labor label
 
         self.on_calculate()
+
+    # ----------------------------
+    # Reading inputs
+    # ----------------------------
 
     def _f(self, w: QLineEdit) -> float:
         return float(w.text().strip())
 
     def read_inputs(self) -> Inputs:
-        automated_people_required = 0.0 if (self.chk_fte.isChecked() and self.chk_auto_to_zero.isChecked()) else 1.0
+        crew_model_on = self.chk_crew_model.isChecked()
+        automated_crew = 0.0 if (crew_model_on and self.chk_auto_to_zero.isChecked()) else 1.0
 
         return Inputs(
             kk=self.kk.currentText().strip().lower(),
@@ -734,11 +780,11 @@ class MainWindow(QWidget):
             working_days_year=self._f(self.days_year),
             working_days_month=self._f(self.days_month),
 
-            crew_per_shift_today=self._f(self.crew_shift_today) if self.chk_fte.isChecked() else 0.0,
-            shifts_per_day=self._f(self.shifts_day) if self.chk_fte.isChecked() else 0.0,
-            hse_min_crew_per_shift=self._f(self.hse_min_shift) if self.chk_fte.isChecked() else 0.0,
-            avg_operator_cost_year=self._f(self.op_cost_year) if self.chk_fte.isChecked() else 0.0,
-            automated_people_required=automated_people_required,
+            crew_per_shift_baseline=self._f(self.crew_baseline) if crew_model_on else 0.0,
+            shifts_per_day=self._f(self.shifts_day) if crew_model_on else 0.0,
+            min_crew_per_shift_hse=self._f(self.hse_floor) if crew_model_on else 0.0,
+            avg_operator_cost_year=self._f(self.op_cost_year) if crew_model_on else 0.0,
+            automated_crew_per_shift=automated_crew,
         )
 
     def read_scope(self) -> Tuple[Dict[str, bool], Dict[str, float], Dict[str, str], Dict[str, float], Dict[str, float]]:
@@ -746,7 +792,7 @@ class MainWindow(QWidget):
         times: Dict[str, float] = {}
         phases: Dict[str, str] = {}
         costs: Dict[str, float] = {}
-        people_today: Dict[str, float] = {}
+        crew_manual: Dict[str, float] = {}
 
         for name, chk in self._use_widgets.items():
             enabled[name] = chk.isChecked()
@@ -760,20 +806,26 @@ class MainWindow(QWidget):
         for name, item in self._cost_items.items():
             costs[name] = float(item.text().strip())
 
-        for name, item in self._people_items.items():
-            people_today[name] = float(item.text().strip())
+        for name, item in self._crew_items.items():
+            crew_manual[name] = float(item.text().strip())
 
-        return enabled, times, phases, costs, people_today
+        return enabled, times, phases, costs, crew_manual
+
+    # ----------------------------
+    # Compute & update UI
+    # ----------------------------
 
     def on_calculate(self) -> None:
         try:
             inputs = self.read_inputs()
-            enabled, times, phases, costs, people_today = self.read_scope()
+            enabled, times, phases, costs, crew_manual = self.read_scope()
 
             if inputs.heat_per_day <= 0:
                 raise ValueError("Heat/day must be > 0.")
             if not (0.0 <= inputs.o2_success <= 1.0):
                 raise ValueError("O₂ success rate must be between 0 and 1.")
+            if inputs.working_days_month <= 0 or inputs.working_days_year <= 0:
+                raise ValueError("Working days/month and days/year must be > 0.")
 
             for k, v in times.items():
                 if enabled.get(k, True) and v <= 0:
@@ -783,9 +835,9 @@ class MainWindow(QWidget):
                 if enabled.get(k, True) and v < 0:
                     raise ValueError(f"Cost must be >= 0 (check '{k}').")
 
-            for k, v in people_today.items():
+            for k, v in crew_manual.items():
                 if enabled.get(k, True) and v < 0:
-                    raise ValueError(f"People today must be >= 0 (check '{k}').")
+                    raise ValueError(f"Crew per shift (manual) must be >= 0 (check '{k}').")
 
             for life_name, life_val in [
                 ("Plate life", inputs.plate_life),
@@ -796,20 +848,17 @@ class MainWindow(QWidget):
                 if life_val <= 0:
                     raise ValueError(f"{life_name} must be > 0.")
 
-            if inputs.working_days_month <= 0 or inputs.working_days_year <= 0:
-                raise ValueError("Working days/month and days/year must be > 0.")
-
-            if self.chk_fte.isChecked():
-                if inputs.crew_per_shift_today < 0:
-                    raise ValueError("Crew today (people/shift) must be >= 0.")
+            if self.chk_crew_model.isChecked():
+                if inputs.crew_per_shift_baseline < 0:
+                    raise ValueError("Crew per shift (baseline) must be >= 0.")
                 if inputs.shifts_per_day <= 0:
-                    raise ValueError("Shifts per day must be > 0.")
-                if inputs.hse_min_crew_per_shift < 0:
-                    raise ValueError("HSE min crew must be >= 0.")
+                    raise ValueError("Number of shifts per day must be > 0.")
+                if inputs.min_crew_per_shift_hse < 0:
+                    raise ValueError("Minimum crew per shift (HSE) must be >= 0.")
                 if inputs.avg_operator_cost_year < 0:
-                    raise ValueError("Avg operator cost/year must be >= 0.")
+                    raise ValueError("Average operator cost per year must be >= 0.")
 
-            baseline_h, phase_res = compute_results(inputs, times, phases, costs, enabled, people_today)
+            baseline_h, phase_res = compute_results(inputs, times, phases, costs, enabled, crew_manual)
 
         except Exception as e:
             QMessageBox.critical(self, "Input error", f"Could not calculate:\n{e}")
@@ -820,20 +869,21 @@ class MainWindow(QWidget):
         self._last_phases = phases
         self._last_costs = costs
         self._last_enabled = enabled
-        self._last_people_today = people_today
+        self._last_crew_manual = crew_manual
         self._last_baseline_h = baseline_h
         self._last_phase_res = phase_res
 
         self.lbl_baseline_main.setText(fmt_h_day(baseline_h))
-        self._update_phase_card(self.card_p1, phase_res[1], 1)
-        self._update_phase_card(self.card_p2, phase_res[2], 2)
-        self._update_phase_card(self.card_p3, phase_res[3], 3)
+
+        self._update_phase_card(self.card_p1, phase_res[1], phase_n=1)
+        self._update_phase_card(self.card_p2, phase_res[2], phase_n=2)
+        self._update_phase_card(self.card_p3, phase_res[3], phase_n=3)
 
     def _update_phase_card(self, card_tuple, res: PhaseResults, phase_n: int) -> None:
-        _, main, remaining, saving, extrap, invest, solutions, crew_lbl, payroll_lbl = card_tuple
+        _, main, remaining, saving, extrap, invest, solutions, crew_lbl, labor_lbl = card_tuple
 
         show_costs = self.chk_show_costs.isChecked()
-        show_payroll = self.chk_fte.isChecked()
+        show_crew = self.chk_crew_model.isChecked()
 
         main.setText(f"{res.saving_h_per_day:.2f} h/day saved")
         remaining.setText(f"Remaining workload:   {fmt_h_day(res.remaining_h_per_day)}")
@@ -852,26 +902,34 @@ class MainWindow(QWidget):
 
         solutions.setText("Solutions used:       " + (", ".join(res.solutions_used) if res.solutions_used else "(none)"))
 
-        if show_payroll:
-            crew_lbl.setText(f"Crew required:         {res.crew_required_per_shift:.0f} people/shift")
-            payroll_lbl.setText(
-                f"Payroll headcount:     {res.payroll_today:.0f} → {res.payroll_required:.0f}  |  Saved: {res.headcount_saved:.0f}  |  {fmt_eur(res.cost_saved_year)}/year"
+        if show_crew:
+            crew_lbl.setText(
+                f"Crew per shift required: {res.crew_per_shift_required:.0f}  |  Total paid headcount required: {res.paid_headcount_required:.0f}"
             )
+            labor_lbl.setText(
+                f"Total paid headcount saved: {res.paid_headcount_saved:.0f}  |  Annual labor cost reduction: {fmt_eur(res.annual_labor_cost_reduction)}"
+            )
+
+    # ----------------------------
+    # Export CSV
+    # ----------------------------
 
     def export_csv(self) -> None:
         if not (
             self._last_inputs and self._last_times and self._last_phases and self._last_costs
             and self._last_phase_res and self._last_baseline_h is not None
-            and self._last_enabled and self._last_people_today
+            and self._last_enabled and self._last_crew_manual
         ):
             QMessageBox.warning(self, "Export CSV", "No results available yet. Click Recalculate first.")
             return
 
         show_costs = self.chk_show_costs.isChecked()
-        show_payroll = self.chk_fte.isChecked()
+        show_crew = self.chk_crew_model.isChecked()
 
         default_name = f"automation_roadmap_{APP_VERSION}_{RELEASE_DATE}.csv".replace(" ", "_")
-        path, _ = QFileDialog.getSaveFileName(self, "Export results to CSV", default_name, "CSV Files (*.csv);;All Files (*)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export results to CSV", default_name, "CSV Files (*.csv);;All Files (*)"
+        )
         if not path:
             return
 
@@ -880,7 +938,7 @@ class MainWindow(QWidget):
         phases = self._last_phases
         costs = self._last_costs
         enabled = self._last_enabled
-        people_today = self._last_people_today
+        crew_manual = self._last_crew_manual
         phase_res = self._last_phase_res
         baseline_h = self._last_baseline_h
 
@@ -899,16 +957,17 @@ class MainWindow(QWidget):
                 w.writerow(["IN life", i.in_life])
                 w.writerow(["PP life", i.pp_life])
                 w.writerow(["O2 success rate", i.o2_success])
-                w.writerow(["Working days/month", i.working_days_month])
-                w.writerow(["Working days/year", i.working_days_year])
+                w.writerow(["Working days per month", i.working_days_month])
+                w.writerow(["Working days per year", i.working_days_year])
                 w.writerow(["Show cost & investment", "yes" if show_costs else "no"])
-                w.writerow(["Enable payroll model", "yes" if show_payroll else "no"])
-                if show_payroll:
-                    w.writerow(["Crew today [people/shift]", i.crew_per_shift_today])
-                    w.writerow(["Shifts/day", i.shifts_per_day])
-                    w.writerow(["HSE min [people/shift]", i.hse_min_crew_per_shift])
-                    w.writerow(["Avg operator cost/year [€]", i.avg_operator_cost_year])
-                    w.writerow(["Automated people required", i.automated_people_required])
+                w.writerow(["Enable crew & labor cost model", "yes" if show_crew else "no"])
+
+                if show_crew:
+                    w.writerow(["Crew per shift (baseline)", i.crew_per_shift_baseline])
+                    w.writerow(["Number of shifts per day", i.shifts_per_day])
+                    w.writerow(["Minimum crew per shift (HSE floor)", i.min_crew_per_shift_hse])
+                    w.writerow(["Average operator cost per year [€]", i.avg_operator_cost_year])
+                    w.writerow(["When automated: crew per shift", i.automated_crew_per_shift])
 
                 w.writerow([])
                 w.writerow(["Baseline workload (h/day)", f"{baseline_h:.4f}"])
@@ -918,7 +977,7 @@ class MainWindow(QWidget):
                 headers = ["Use", "Function", "Phase", "Time/op [min]"]
                 if show_costs:
                     headers.append("Cost [k€]")
-                headers.append("People today [per shift]")
+                headers.append("Crew per shift (manual)")
                 w.writerow(headers)
 
                 for d in ops_definitions():
@@ -931,26 +990,27 @@ class MainWindow(QWidget):
                     ]
                     if show_costs:
                         row.append(f"{costs.get(name, d.default_cost_k_eur):.4f}")
-                    row.append(f"{people_today.get(name, d.default_people_today):.2f}")
+                    row.append(f"{crew_manual.get(name, d.default_crew_per_shift_manual):.2f}")
                     w.writerow(row)
 
                 w.writerow([])
                 w.writerow(["RESULTS BY PHASE"])
 
-                res_headers = ["Phase", "Saving [h/day]", "Remaining [h/day]", "Reduction [%]", "Saving [h/month]", "Saving [h/year]"]
+                res_headers = [
+                    "Phase", "Saving [h/day]", "Remaining [h/day]", "Reduction [%]",
+                    "Saving [h/month]", "Saving [h/year]", "Solutions used"
+                ]
                 if show_costs:
-                    res_headers.extend(["Investment incremental [k€]", "Investment total [k€]"])
-                res_headers.append("Solutions used")
-
-                if show_payroll:
+                    res_headers.insert(6, "Investment incremental [k€]")
+                    res_headers.insert(7, "Investment total [k€]")
+                if show_crew:
                     res_headers.extend([
-                        "Crew required [people/shift]",
-                        "Payroll today [headcount]",
-                        "Payroll required [headcount]",
-                        "Headcount saved",
-                        "Annual cost reduction [€]"
+                        "Crew per shift required",
+                        "Total paid headcount (baseline)",
+                        "Total paid headcount required",
+                        "Total paid headcount saved",
+                        "Annual labor cost reduction [€]"
                     ])
-
                 w.writerow(res_headers)
 
                 for p in (1, 2, 3):
@@ -958,3 +1018,42 @@ class MainWindow(QWidget):
                     row = [
                         f"Phase {p}",
                         f"{r.saving_h_per_day:.6f}",
+                        f"{r.remaining_h_per_day:.6f}",
+                        f"{(r.saving_pct*100):.2f}",
+                        f"{r.saving_h_per_month:.3f}",
+                        f"{r.saving_h_per_year:.3f}",
+                    ]
+                    if show_costs:
+                        row.append(f"{r.investment_k_eur_incremental:.3f}")
+                        row.append(f"{r.investment_k_eur_total:.3f}")
+                    row.append("; ".join(r.solutions_used))
+
+                    if show_crew:
+                        row.extend([
+                            f"{r.crew_per_shift_required:.0f}",
+                            f"{r.paid_headcount_baseline:.0f}",
+                            f"{r.paid_headcount_required:.0f}",
+                            f"{r.paid_headcount_saved:.0f}",
+                            f"{r.annual_labor_cost_reduction:.2f}",
+                        ])
+
+                    w.writerow(row)
+
+            QMessageBox.information(self, "Export CSV", f"Exported successfully:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export CSV", f"Failed to export:\n{e}")
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+
+    w = MainWindow()
+    w.resize(1400, 860)
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
