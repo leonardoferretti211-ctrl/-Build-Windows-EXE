@@ -23,7 +23,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --noconfirm --clean --windowed --onefile  --name "EVC_Calculator" --add-data "vesuvius_logo.png;." tool6.py
+        pyinstaller --noconfirm --clean --windowed --onefile  --name "EVC_Calculator" --add-data "vesuvius_logo.png" tool6.py
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
